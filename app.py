@@ -3,71 +3,67 @@ import random
 
 app = Flask(__name__)
 
-# --------- Core Utils ----------
+def luhn(card_number):
+    total = 0
+    reverse_digits = card_number[::-1]
+    for i, digit in enumerate(reverse_digits):
+        n = int(digit)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
 
-def luhn_checksum(card_number):
-    def digits_of(n): return [int(d) for d in str(n)]
-    digits = digits_of(card_number)
-    odd = digits[-1::-2]
-    even = digits[-2::-2]
-    total = sum(odd)
-    for d in even:
-        total += sum(digits_of(d * 2))
-    return total % 10
+def generate_card(bin_template):
+    while True:
+        card = ''.join(str(random.randint(0, 9)) if ch == 'x' else ch for ch in bin_template)
+        if luhn(card):
+            return card
 
-def complete_luhn(prefix, total_length):
-    number = prefix
-    while len(number) < (total_length - 1):
-        number += str(random.randint(0, 9))
-    check_digit = (10 - luhn_checksum(int(number) * 10)) % 10
-    return number + str(check_digit)
-
-def detect_card_type(card_number):
-    if card_number.startswith('4'):
+def detect_card_type(number):
+    if number.startswith('4'):
         return 'visa'
-    elif 51 <= int(card_number[:2]) <= 55 or 2221 <= int(card_number[:4]) <= 2720:
+    elif number.startswith(('51', '52', '53', '54', '55')):
         return 'mastercard'
-    elif 50 <= int(card_number[:2]) <= 69:
-        return 'maestro'
+    elif number.startswith(('34', '37')):
+        return 'amex'
+    elif number.startswith(('6011', '622', '64', '65')):
+        return 'discover'
     else:
         return 'unknown'
-
-# --------- API Route ----------
 
 @app.route('/api/ccgenerator', methods=['GET'])
 def cc_generator():
     bin_input = request.args.get('bin')
     count = int(request.args.get('count', 1))
 
-    if not bin_input:
-        return jsonify({'error': 'Missing BIN input'}), 400
-
-    results = []
+    if not bin_input or 'x' not in bin_input:
+        return jsonify({'error': 'Invalid BIN format'}), 400
 
     try:
         parts = bin_input.split('|')
-        number_part = parts[0].replace('x', '')
-        masked_len = len(parts[0])
-        exp_month = parts[1] if len(parts) > 1 else f"{random.randint(1, 12):02d}"
+        bin_template = parts[0]
+        exp_month = parts[1] if len(parts) > 1 else str(random.randint(1, 12)).zfill(2)
         exp_year = parts[2] if len(parts) > 2 else str(random.randint(2025, 2030))
-        cvv = parts[3] if len(parts) > 3 else None
+        cvv = parts[3] if len(parts) > 3 else str(random.randint(0, 999)).zfill(3)
+    except Exception:
+        return jsonify({'error': 'Error parsing BIN input'}), 400
 
-        for _ in range(count):
-            card_number = complete_luhn(number_part, masked_len)
-            full_cvv = cvv if cvv else f"{random.randint(100, 999)}"
-            results.append({
-                "card": f"{card_number}|{exp_month}|{exp_year}|{full_cvv}",
-                "card_type": detect_card_type(card_number)
-            })
-
-        return jsonify({
-            "input": bin_input,
-            "generated": results,
-            "count": len(results)
+    cards = []
+    for _ in range(count):
+        card_number = generate_card(bin_template)
+        card_type = detect_card_type(card_number)
+        cards.append({
+            'card': f'{card_number}|{exp_month}|{exp_year}|{cvv}',
+            'card_type': card_type
         })
 
-    except Exception as e:
-        return jsonify({'error': 'Invalid input format', 'details': str(e)}), 400
+    return jsonify({
+        'count': count,
+        'generated': cards,
+        'input': bin_input
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
