@@ -136,56 +136,65 @@ def cc_generator():
         bin_input = request.args.get('bin', '')
         count = min(int(request.args.get('count', 1)), 100)
         formatted = request.args.get('formatted', 'true').lower() == 'true'
-        
+        plaintext = request.args.get('plaintext', 'false').lower() == 'true'  # নতুন ফ্ল্যাগ
+
         if not bin_input:
             return jsonify({'error': 'BIN parameter is required'}), 400
-            
+
         if not validate_bin_format(bin_input):
-            return jsonify({'error': 'Invalid BIN format. Use format like "4111xx|12|25|123" or "4111xx"'}), 400
-        
+            return jsonify({'error': 'Invalid BIN format.'}), 400
+
         if count < 1 or count > 100:
             return jsonify({'error': 'Count must be between 1 and 100'}), 400
-        
+
         raw_bin, exp_month, exp_year, cvv = parse_bin_input(bin_input)
         partial_bin = raw_bin.replace('x', '')
         card_type = detect_card_type(partial_bin)
         card_length = get_card_length(card_type)
-        
+
         generated_cards = []
         for _ in range(count):
             card_number = generate_card_number(partial_bin, card_length)
             detected_type = detect_card_type(card_number)
             final_cvv = cvv if cvv is not None else generate_cvv(detected_type)
-            
-            if formatted:
-                if detected_type == 'amex':
-                    formatted_number = f"{card_number[:4]} {card_number[4:10]} {card_number[10:]}"
-                else:
-                    formatted_number = ' '.join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
-                
-                generated_cards.append({
-                    'card_number': formatted_number,
-                    'raw_card_number': card_number,
-                    'expiry': f"{exp_month}/{exp_year[-2:]}",
-                    'expiry_month': exp_month,
-                    'expiry_year': exp_year,
-                    'cvv': final_cvv,
-                    'card_type': detected_type,
-                    'formatted': True
-                })
+            exp = f"{exp_month}|{exp_year}"
+
+            if plaintext:
+                generated_cards.append(f"{card_number}|{exp}|{final_cvv}")
             else:
-                generated_cards.append({
-                    'card': f"{card_number}|{exp_month}|{exp_year}|{final_cvv}",
-                    'card_number': card_number,
-                    'expiry_month': exp_month,
-                    'expiry_year': exp_year,
-                    'cvv': final_cvv,
-                    'card_type': detected_type,
-                    'formatted': False
-                })
-        
+                if formatted:
+                    if detected_type == 'amex':
+                        formatted_number = f"{card_number[:4]} {card_number[4:10]} {card_number[10:]}"
+                    else:
+                        formatted_number = ' '.join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
+
+                    generated_cards.append({
+                        'card_number': formatted_number,
+                        'raw_card_number': card_number,
+                        'expiry': f"{exp_month}/{exp_year[-2:]}",
+                        'expiry_month': exp_month,
+                        'expiry_year': exp_year,
+                        'cvv': final_cvv,
+                        'card_type': detected_type,
+                        'formatted': True
+                    })
+                else:
+                    generated_cards.append({
+                        'card': f"{card_number}|{exp}|{final_cvv}",
+                        'card_number': card_number,
+                        'expiry_month': exp_month,
+                        'expiry_year': exp_year,
+                        'cvv': final_cvv,
+                        'card_type': detected_type,
+                        'formatted': False
+                    })
+
         logger.info(f"Generated {count} cards for BIN: {partial_bin[:6]}...")
-        
+
+        # যদি plaintext=True, তাহলে শুধু raw string return করবে
+        if plaintext:
+            return '\n'.join(generated_cards), 200, {'Content-Type': 'text/plain'}
+
         return jsonify({
             'status': 'success',
             'request': {
@@ -201,7 +210,7 @@ def cc_generator():
             },
             'generated': generated_cards
         })
-        
+
     except Exception as e:
         logger.error(f"Error generating cards: {str(e)}")
         return jsonify({'error': str(e)}), 500
