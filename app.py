@@ -3,6 +3,13 @@ import random
 
 app = Flask(__name__)
 
+CARD_LENGTHS = {
+    'visa': 16,
+    'mastercard': 16,
+    'amex': 15,
+    'discover': 16
+}
+
 def luhn(card_number):
     total = 0
     reverse_digits = card_number[::-1]
@@ -15,12 +22,6 @@ def luhn(card_number):
         total += n
     return total % 10 == 0
 
-def generate_card(bin_template):
-    while True:
-        card = ''.join(str(random.randint(0, 9)) if ch == 'x' else ch for ch in bin_template)
-        if luhn(card):
-            return card
-
 def detect_card_type(number):
     if number.startswith('4'):
         return 'visa'
@@ -30,39 +31,50 @@ def detect_card_type(number):
         return 'amex'
     elif number.startswith(('6011', '622', '64', '65')):
         return 'discover'
-    else:
-        return 'unknown'
+    return 'unknown'
+
+def generate_card_number(partial_bin, length):
+    x_count = length - len(partial_bin)
+    while True:
+        random_part = ''.join(random.choice('0123456789') for _ in range(x_count))
+        card_number = partial_bin + random_part
+        if luhn(card_number):
+            return card_number
 
 @app.route('/api/ccgenerator', methods=['GET'])
 def cc_generator():
-    bin_input = request.args.get('bin')
+    bin_input = request.args.get('bin', '')
     count = int(request.args.get('count', 1))
-
-    if not bin_input or 'x' not in bin_input:
-        return jsonify({'error': 'Invalid BIN format'}), 400
 
     try:
         parts = bin_input.split('|')
-        bin_template = parts[0]
+        raw_bin = parts[0]
         exp_month = parts[1] if len(parts) > 1 else str(random.randint(1, 12)).zfill(2)
         exp_year = parts[2] if len(parts) > 2 else str(random.randint(2025, 2030))
         cvv = parts[3] if len(parts) > 3 else str(random.randint(0, 999)).zfill(3)
     except Exception:
         return jsonify({'error': 'Error parsing BIN input'}), 400
 
-    cards = []
+    # Remove x from BIN
+    partial_bin = raw_bin.replace('x', '')
+
+    # Detect card type
+    card_type = detect_card_type(partial_bin)
+    card_length = CARD_LENGTHS.get(card_type, 16)  # Default to 16 if unknown
+
+    generated_cards = []
     for _ in range(count):
-        card_number = generate_card(bin_template)
-        card_type = detect_card_type(card_number)
-        cards.append({
+        card_number = generate_card_number(partial_bin, card_length)
+        detected_type = detect_card_type(card_number)
+        generated_cards.append({
             'card': f'{card_number}|{exp_month}|{exp_year}|{cvv}',
-            'card_type': card_type
+            'card_type': detected_type
         })
 
     return jsonify({
+        'input': bin_input,
         'count': count,
-        'generated': cards,
-        'input': bin_input
+        'generated': generated_cards
     })
 
 if __name__ == '__main__':
