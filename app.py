@@ -1,8 +1,7 @@
-from flask import Flask, request, jsonify, abort, g
+from flask import Flask, request, jsonify, abort
 import random
 import re
 import logging
-import requests
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime
 
@@ -39,9 +38,13 @@ CARD_PREFIXES = {
 }
 
 def validate_bin_format(bin_input):
-    return bool(re.match(r'^(\d+x*)(\|\d{2})?(\|\d{2,4})?(\|\d{3,4})?$', bin_input))
+    """Validate the BIN input format"""
+    if not re.match(r'^(\d+x*)(\|\d{2})?(\|\d{2,4})?(\|\d{3,4})?$', bin_input):
+        return False
+    return True
 
 def detect_card_type(number):
+    """Detect card type based on the first digits"""
     for card_type, prefixes in CARD_PREFIXES.items():
         for prefix in prefixes:
             if number.startswith(prefix):
@@ -49,11 +52,17 @@ def detect_card_type(number):
     return 'unknown'
 
 def get_card_length(card_type):
+    """Get the appropriate length for a card type"""
     length = CARD_LENGTHS.get(card_type, 16)
-    return random.choice(length) if isinstance(length, list) else length
+    if isinstance(length, list):
+        return random.choice(length)
+    return length
 
 def luhn_checksum(card_number):
-    def digits_of(n): return [int(d) for d in str(n)]
+    """Calculate the Luhn checksum"""
+    def digits_of(n):
+        return [int(d) for d in str(n)]
+    
     digits = digits_of(card_number)
     odd_digits = digits[-1::-2]
     even_digits = digits[-2::-2]
@@ -63,67 +72,63 @@ def luhn_checksum(card_number):
     return checksum % 10
 
 def calculate_luhn(partial_number):
+    """Calculate the Luhn check digit"""
     checksum = luhn_checksum(partial_number + '0')
     return (10 - checksum) % 10
 
 def generate_card_number(partial_bin, length):
+    """Generate a valid card number"""
     partial_bin = partial_bin[:length-1]
     needed_digits = length - len(partial_bin) - 1
+    
     if needed_digits < 0:
         raise ValueError("BIN is too long for the card type")
+    
     middle_digits = ''.join(random.choice('0123456789') for _ in range(needed_digits))
     check_digit = str(calculate_luhn(partial_bin + middle_digits))
+    
     return partial_bin + middle_digits + check_digit
 
+def generate_expiry_date():
+    """Generate a random future expiry date"""
+    now = datetime.now()
+    month = random.randint(1, 12)
+    year = random.randint(now.year, now.year + 8)
+    return f"{month:02d}|{year}"
+
 def generate_cvv(card_type):
-    return str(random.randint(1000, 9999)) if card_type == 'amex' else str(random.randint(100, 999)).zfill(3)
+    """Generate a random CVV"""
+    if card_type == 'amex':
+        return str(random.randint(1000, 9999))
+    return str(random.randint(100, 999)).zfill(3)
 
 def parse_bin_input(bin_input):
+    """Parse the BIN input into components"""
     parts = bin_input.split('|')
     raw_bin = parts[0]
     exp_month = parts[1] if len(parts) > 1 else f"{random.randint(1, 12):02d}"
+    
     if len(parts) > 2:
         exp_year = parts[2]
         if len(exp_year) == 2:
-            century = datetime.now().year // 100
+            current_year = datetime.now().year
+            century = current_year // 100
             exp_year = f"{century}{exp_year}"
     else:
         exp_year = str(random.randint(datetime.now().year, datetime.now().year + 8))
+    
     if len(parts) > 3:
-        cvv = parts[3].zfill(3)[:4]
+        cvv = parts[3]
+        if len(cvv) == 3 or len(cvv) == 4:
+            pass
+        elif len(cvv) < 3:
+            cvv = cvv.zfill(3)
+        else:
+            cvv = cvv[:4]
     else:
         cvv = None
+    
     return raw_bin, exp_month, exp_year, cvv
-
-def lookup_bin_info(bin_prefix):
-    try:
-        response = requests.get(f"https://lookup.binlist.net/{bin_prefix}", headers={"Accept-Version": "3"})
-        return response.json() if response.status_code == 200 else None
-    except Exception as e:
-        logger.warning(f"BIN lookup failed: {e}")
-        return None
-
-def get_bin_metadata(bin_prefix):
-    bin_info = lookup_bin_info(bin_prefix)
-    if not bin_info:
-        return {
-            "country": "Unknown",
-            "bank": "Unknown",
-            "scheme": "Unknown",
-            "type": "Unknown",
-            "brand": "Unknown"
-        }
-    return {
-        "country": f"{bin_info['country']['name']} ({bin_info['country']['alpha2']}) {bin_info['country'].get('emoji', '')}",
-        "bank": bin_info['bank']['name'] if bin_info.get('bank') else 'Unknown',
-        "scheme": bin_info.get('scheme', 'Unknown'),
-        "type": bin_info.get('type', 'Unknown'),
-        "brand": bin_info.get('brand', 'Unknown')
-    }
-
-@app.before_request
-def assign_request_id():
-    g.request_id = random.randint(100000, 999999)
 
 @app.route('/api/ccgenerator', methods=['GET'])
 def cc_generator():
@@ -131,13 +136,16 @@ def cc_generator():
         bin_input = request.args.get('bin', '')
         count = min(int(request.args.get('count', 1)), 100)
         formatted = request.args.get('formatted', 'true').lower() == 'true'
-        plaintext = request.args.get('plaintext', 'false').lower() == 'true'
+        plaintext = request.args.get('plaintext', 'false').lower() == 'true'  # নতুন ফ্ল্যাগ
 
         if not bin_input:
             return jsonify({'error': 'BIN parameter is required'}), 400
 
         if not validate_bin_format(bin_input):
-            return jsonify({'error': 'Invalid BIN format'}), 400
+            return jsonify({'error': 'Invalid BIN format.'}), 400
+
+        if count < 1 or count > 100:
+            return jsonify({'error': 'Count must be between 1 and 100'}), 400
 
         raw_bin, exp_month, exp_year, cvv = parse_bin_input(bin_input)
         partial_bin = raw_bin.replace('x', '')
@@ -148,18 +156,18 @@ def cc_generator():
         for _ in range(count):
             card_number = generate_card_number(partial_bin, card_length)
             detected_type = detect_card_type(card_number)
-            final_cvv = cvv if cvv else generate_cvv(detected_type)
+            final_cvv = cvv if cvv is not None else generate_cvv(detected_type)
             exp = f"{exp_month}|{exp_year}"
 
             if plaintext:
                 generated_cards.append(f"{card_number}|{exp}|{final_cvv}")
             else:
                 if formatted:
-                    formatted_number = (
-                        f"{card_number[:4]} {card_number[4:10]} {card_number[10:]}"
-                        if detected_type == 'amex'
-                        else ' '.join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
-                    )
+                    if detected_type == 'amex':
+                        formatted_number = f"{card_number[:4]} {card_number[4:10]} {card_number[10:]}"
+                    else:
+                        formatted_number = ' '.join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
+
                     generated_cards.append({
                         'card_number': formatted_number,
                         'raw_card_number': card_number,
@@ -181,26 +189,40 @@ def cc_generator():
                         'formatted': False
                     })
 
-        metadata = get_bin_metadata(partial_bin[:6])
+        logger.info(f"Generated {count} cards for BIN: {partial_bin[:6]}...")
 
+        # যদি plaintext=True, তাহলে শুধু raw string return করবে
         if plaintext:
             return '\n'.join(generated_cards), 200, {'Content-Type': 'text/plain'}
 
         return jsonify({
             'status': 'success',
-            'request_id': g.request_id,
             'request': {
                 'bin': bin_input,
                 'count': count,
                 'formatted': formatted
             },
-            'metadata': metadata,
+            'metadata': {
+                'bin_country': get_bin_country(partial_bin[:6]),
+                'bin_bank': get_bin_bank(partial_bin[:6]),
+                'card_type': card_type,
+                'card_length': card_length
+            },
             'generated': generated_cards
         })
 
     except Exception as e:
         logger.error(f"Error generating cards: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+# Mock functions
+def get_bin_country(bin_prefix):
+    countries = ['US', 'GB', 'CA', 'AU', 'DE', 'FR', 'JP', 'CN']
+    return random.choice(countries)
+
+def get_bin_bank(bin_prefix):
+    banks = ['Chase', 'Bank of America', 'Wells Fargo', 'Citibank', 'Barclays', 'HSBC']
+    return random.choice(banks)
 
 @app.errorhandler(400)
 def bad_request(error):
