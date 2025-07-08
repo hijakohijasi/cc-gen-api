@@ -1,240 +1,337 @@
-from flask import Flask, request, jsonify, abort
-import random
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import re
-import logging
-from werkzeug.middleware.proxy_fix import ProxyFix
-from datetime import datetime
+import random
+import aiohttp
+import os
+from typing import Optional, List
+from datetime import datetime, timedelta
+from fastapi import Response
 
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI(
+    title="Public CC Generator API",
+    description="API for generating valid credit card numbers with BIN information (No Authentication Required)",
+    version="1.0",
+    contact={
+        "name": "API Support",
+        "url": "https://t.me/TheSmartDev",
+    },
+    license_info={
+        "name": "MIT",
+    },
+)
 
-# Constants
-CARD_LENGTHS = {
-    'visa': [13, 16],
-    'mastercard': 16,
-    'amex': 15,
-    'discover': 16,
-    'jcb': 16,
-    'diners': 14,
-    'maestro': [12, 13, 14, 15, 16, 17, 18, 19],
-    'unionpay': [16, 17, 18, 19]
-}
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-CARD_PREFIXES = {
-    'visa': ['4'],
-    'mastercard': ['51', '52', '53', '54', '55', '2221', '2222', '2223', '2224', '2225', 
-                  '2226', '2227', '2228', '2229', '223', '224', '225', '226', '227', '228', 
-                  '229', '23', '24', '25', '26', '270', '271', '2720'],
-    'amex': ['34', '37'],
-    'discover': ['6011', '644', '645', '646', '647', '648', '649', '65'],
-    'jcb': ['3528', '3529', '353', '354', '355', '356', '357', '358'],
-    'diners': ['300', '301', '302', '303', '304', '305', '36', '38', '39'],
-    'maestro': ['5018', '5020', '5038', '5893', '6304', '6759', '6761', '6762', '6763'],
-    'unionpay': ['62', '81']
-}
+# Configuration
+MAX_GEN_LIMIT = 50  # Maximum cards per request
+DEFAULT_GEN_LIMIT = 5  # Default cards if limit not specified
 
-def validate_bin_format(bin_input):
-    """Validate the BIN input format"""
-    if not re.match(r'^(\d+x*)(\|\d{2})?(\|\d{2,4})?(\|\d{3,4})?$', bin_input):
+# Models
+class CardInfo(BaseModel):
+    number: str
+    expiry: str
+    cvv: str
+    brand: Optional[str] = None
+    type: Optional[str] = None
+
+class BinInfo(BaseModel):
+    bin: str
+    bank: Optional[str] = None
+    country: Optional[str] = None
+    country_code: Optional[str] = None
+    flag: Optional[str] = None
+    scheme: Optional[str] = None
+    type: Optional[str] = None
+    prepaid: Optional[bool] = None
+    tier: Optional[str] = None
+    currency: Optional[str] = None
+
+class GenerateResponse(BaseModel):
+    cards: List[CardInfo]
+    bin_info: BinInfo
+    generated_at: str
+
+# Helper Functions
+def luhn_checksum(card_number: str) -> bool:
+    """Validate card number using Luhn algorithm with double verification"""
+    if not card_number.isdigit():
         return False
-    return True
 
-def detect_card_type(number):
-    """Detect card type based on the first digits"""
-    for card_type, prefixes in CARD_PREFIXES.items():
-        for prefix in prefixes:
-            if number.startswith(prefix):
-                return card_type
-    return 'unknown'
+    total = 0
+    reverse_digits = card_number[::-1]
 
-def get_card_length(card_type):
-    """Get the appropriate length for a card type"""
-    length = CARD_LENGTHS.get(card_type, 16)
-    if isinstance(length, list):
-        return random.choice(length)
-    return length
+    for i, digit in enumerate(reverse_digits):
+        digit = int(digit)
+        if i % 2 == 1:  # Double every second digit
+            digit *= 2
+            if digit > 9:
+                digit = (digit // 10) + (digit % 10)
+        total += digit
 
-def luhn_checksum(card_number):
-    """Calculate the Luhn checksum"""
-    def digits_of(n):
-        return [int(d) for d in str(n)]
-    
-    digits = digits_of(card_number)
-    odd_digits = digits[-1::-2]
-    even_digits = digits[-2::-2]
-    checksum = sum(odd_digits)
-    for d in even_digits:
-        checksum += sum(digits_of(d * 2))
-    return checksum % 10
+    return total % 10 == 0
 
-def calculate_luhn(partial_number):
-    """Calculate the Luhn check digit"""
-    checksum = luhn_checksum(partial_number + '0')
-    return (10 - checksum) % 10
+def generate_card_number(bin: str) -> str:
+    """Generate valid card number from BIN with triple Luhn verification"""
+    # Clean the BIN (remove non-digits)
+    clean_bin = re.sub(r'[^\d]', '', bin)
 
-def generate_card_number(partial_bin, length):
-    """Generate a valid card number"""
-    partial_bin = partial_bin[:length-1]
-    needed_digits = length - len(partial_bin) - 1
-    
-    if needed_digits < 0:
-        raise ValueError("BIN is too long for the card type")
-    
-    middle_digits = ''.join(random.choice('0123456789') for _ in range(needed_digits))
-    check_digit = str(calculate_luhn(partial_bin + middle_digits))
-    
-    return partial_bin + middle_digits + check_digit
+    # Validate BIN length
+    if len(clean_bin) < 6 or len(clean_bin) > 15:
+        raise ValueError("BIN must be between 6-15 digits")
 
-def generate_expiry_date():
-    """Generate a random future expiry date"""
-    now = datetime.now()
-    month = random.randint(1, 12)
-    year = random.randint(now.year, now.year + 8)
-    return f"{month:02d}|{year}"
+    # Generate the base number (BIN + random digits, leaving room for check digit)
+    missing_digits = 15 - len(clean_bin)
+    if missing_digits < 0:
+        raise ValueError("BIN too long")
 
-def generate_cvv(card_type):
-    """Generate a random CVV"""
-    if card_type == 'amex':
-        return str(random.randint(1000, 9999))
-    return str(random.randint(100, 999)).zfill(3)
+    # Generate random middle digits
+    middle_digits = ''.join([str(random.randint(0, 9)) for _ in range(missing_digits)])
+    partial_number = clean_bin + middle_digits
 
-def parse_bin_input(bin_input):
-    """Parse the BIN input into components"""
-    parts = bin_input.split('|')
-    raw_bin = parts[0]
-    exp_month = parts[1] if len(parts) > 1 else f"{random.randint(1, 12):02d}"
-    
-    if len(parts) > 2:
-        exp_year = parts[2]
-        if len(exp_year) == 2:
-            current_year = datetime.now().year
-            century = current_year // 100
-            exp_year = f"{century}{exp_year}"
-    else:
-        exp_year = str(random.randint(datetime.now().year, datetime.now().year + 8))
-    
-    if len(parts) > 3:
-        cvv = parts[3]
-        if len(cvv) == 3 or len(cvv) == 4:
-            pass
-        elif len(cvv) < 3:
-            cvv = cvv.zfill(3)
-        else:
-            cvv = cvv[:4]
-    else:
-        cvv = None
-    
-    return raw_bin, exp_month, exp_year, cvv
+    # Calculate Luhn check digit
+    total = 0
+    for i, digit in enumerate(partial_number[::-1]):
+        digit = int(digit)
+        if i % 2 == 0:  # Double every second digit from right (0-indexed)
+            digit *= 2
+            if digit > 9:
+                digit = (digit // 10) + (digit % 10)
+        total += digit
 
-@app.route('/api/ccgenerator', methods=['GET'])
-def cc_generator():
+    check_digit = (10 - (total % 10)) % 10
+    full_number = partial_number + str(check_digit)
+
+    # Triple verification
+    if not luhn_checksum(full_number):
+        # If failed, regenerate (should theoretically never happen)
+        return generate_card_number(bin)
+
+    # Additional format check
+    if len(full_number) not in (15, 16) or not full_number.isdigit():
+        return generate_card_number(bin)
+
+    return full_number
+
+def generate_expiry() -> tuple:
+    """Generate random future expiry date"""
+    expiry_date = datetime.now() + timedelta(days=random.randint(365, 365*5))
+    return (expiry_date.strftime("%m"), expiry_date.strftime("%y"))
+
+def generate_cvv(card_type: Optional[str]) -> str:
+    """Generate random CVV with correct length for card type"""
+    if card_type and "amex" in card_type.lower():
+        return str(random.randint(1000, 9999))  # Amex has 4-digit CVV
+    return str(random.randint(100, 999))  # Others have 3-digit CVV
+
+async def get_bin_info(bin: str) -> Optional[dict]:
+    """Fetch BIN information from multiple public APIs"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    bin_to_use = bin[:6]
+
+    # 1. Try HandyAPI first
     try:
-        bin_input = request.args.get('bin', '')
-        count = min(int(request.args.get('count', 1)), 100)
-        formatted = request.args.get('formatted', 'true').lower() == 'true'
-        plaintext = request.args.get('plaintext', 'false').lower() == 'true'  # নতুন ফ্ল্যাগ
-
-        if not bin_input:
-            return jsonify({'error': 'BIN parameter is required'}), 400
-
-        if not validate_bin_format(bin_input):
-            return jsonify({'error': 'Invalid BIN format.'}), 400
-
-        if count < 1 or count > 100:
-            return jsonify({'error': 'Count must be between 1 and 100'}), 400
-
-        raw_bin, exp_month, exp_year, cvv = parse_bin_input(bin_input)
-        partial_bin = raw_bin.replace('x', '')
-        card_type = detect_card_type(partial_bin)
-        card_length = get_card_length(card_type)
-
-        generated_cards = []
-        for _ in range(count):
-            card_number = generate_card_number(partial_bin, card_length)
-            detected_type = detect_card_type(card_number)
-            final_cvv = cvv if cvv is not None else generate_cvv(detected_type)
-            exp = f"{exp_month}|{exp_year}"
-
-            if plaintext:
-                generated_cards.append(f"{card_number}|{exp}|{final_cvv}")
-            else:
-                if formatted:
-                    if detected_type == 'amex':
-                        formatted_number = f"{card_number[:4]} {card_number[4:10]} {card_number[10:]}"
-                    else:
-                        formatted_number = ' '.join([card_number[i:i+4] for i in range(0, len(card_number), 4)])
-
-                    generated_cards.append({
-                        'card_number': formatted_number,
-                        'raw_card_number': card_number,
-                        'expiry': f"{exp_month}/{exp_year[-2:]}",
-                        'expiry_month': exp_month,
-                        'expiry_year': exp_year,
-                        'cvv': final_cvv,
-                        'card_type': detected_type,
-                        'formatted': True
-                    })
-                else:
-                    generated_cards.append({
-                        'card': f"{card_number}|{exp}|{final_cvv}",
-                        'card_number': card_number,
-                        'expiry_month': exp_month,
-                        'expiry_year': exp_year,
-                        'cvv': final_cvv,
-                        'card_type': detected_type,
-                        'formatted': False
-                    })
-
-        logger.info(f"Generated {count} cards for BIN: {partial_bin[:6]}...")
-
-        # যদি plaintext=True, তাহলে শুধু raw string return করবে
-        if plaintext:
-            return '\n'.join(generated_cards), 200, {'Content-Type': 'text/plain'}
-
-        return jsonify({
-            'status': 'success',
-            'request': {
-                'bin': bin_input,
-                'count': count,
-                'formatted': formatted
-            },
-            'metadata': {
-                'bin_country': get_bin_country(partial_bin[:6]),
-                'bin_bank': get_bin_bank(partial_bin[:6]),
-                'card_type': card_type,
-                'card_length': card_length
-            },
-            'generated': generated_cards
-        })
-
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://data.handyapi.com/bin/{bin_to_use}",
+                headers={**headers, "x-api-key": "handyapi-pub-4c5376b7b41649ce93d4b7f93984f088"}
+            ) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    if data.get("Status") == "SUCCESS":
+                        country = data.get("Country", {}).get("Name", "").upper()
+                        return {
+                            "type": data.get("Type"),
+                            "scheme": data.get("Scheme"),
+                            "tier": data.get("CardTier"),
+                            "bank": data.get("Issuer"),
+                            "country": country,
+                            "currency": "N/A",
+                            "country_code": data.get("Country", {}).get("A2", "N/A"),
+                            "flag": get_flag_emoji(data.get("Country", {}).get("A2")),
+                            "prepaid": data.get("Prepaid") == "Yes",
+                            "luhn": True
+                        }
     except Exception as e:
-        logger.error(f"Error generating cards: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        print("HandyAPI error:", e)
 
-# Mock functions
-def get_bin_country(bin_prefix):
-    countries = ['US', 'GB', 'CA', 'AU', 'DE', 'FR', 'JP', 'CN']
-    return random.choice(countries)
+    # 2. Fallback to binlist.net
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://lookup.binlist.net/{bin_to_use}", 
+                headers=headers
+            ) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    country = data.get("country", {}).get("name", "").upper()
+                    return {
+                        "type": data.get("type"),
+                        "scheme": data.get("scheme"),
+                        "tier": data.get("brand"),
+                        "bank": data.get("bank", {}).get("name"),
+                        "country": country,
+                        "currency": data.get("country", {}).get("currency"),
+                        "country_code": data.get("country", {}).get("alpha2"),
+                        "flag": data.get("country", {}).get("emoji", "🏳️"),
+                        "prepaid": data.get("prepaid", False),
+                        "luhn": data.get("number", {}).get("luhn", True)
+                    }
+    except Exception as e:
+        print("binlist.net error:", e)
 
-def get_bin_bank(bin_prefix):
-    banks = ['Chase', 'Bank of America', 'Wells Fargo', 'Citibank', 'Barclays', 'HSBC']
-    return random.choice(banks)
+    return None
 
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify({'error': 'Bad request', 'message': str(error)}), 400
+def get_flag_emoji(country_code: str) -> str:
+    """Get flag emoji from country code"""
+    if not country_code or len(country_code) != 2:
+        return "🏳️"
+    try:
+        return chr(0x1F1E6 + ord(country_code[0].upper())-65) + chr(0x1F1E6 + ord(country_code[1].upper())-65)
+    except:
+        return "🏳️"
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Not found', 'message': str(error)}), 404
+# API Endpoints
+@app.get("/", include_in_schema=False)
+async def root():
+    return {
+        "message": "Public CC Generator API",
+        "endpoints": {
+            "/generate": "Generate CCs (JSON)",
+            "/generate/file": "Download CCs as file",
+            "/bin/{bin}": "Get BIN info"
+        }
+    }
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error', 'message': str(error)}), 500
+@app.get("/generate", response_model=GenerateResponse)
+async def generate_cards(
+    bin: str = Query(..., min_length=6, max_length=16, description="First 6+ digits of card number"),
+    limit: int = Query(DEFAULT_GEN_LIMIT, ge=1, le=MAX_GEN_LIMIT, description="Number of cards to generate (max 50)"),
+    month: Optional[str] = Query(None, pattern="^(0[1-9]|1[0-2])$", description="Expiry month (MM)"),
+    year: Optional[str] = Query(None, pattern="^(2[3-9]|[3-9][0-9])$", description="Expiry year (YY)"),
+    cvv: Optional[str] = Query(None, pattern="^[0-9]{3,4}$", description="CVV (3 or 4 digits)")
+):
+    try:
+        # Get BIN info from multiple sources
+        bin_info = await get_bin_info(bin)
+        if not bin_info:
+            raise HTTPException(400, "Couldn't fetch BIN details from any source")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+        # Generate cards with unique expiry dates and proper CVV lengths
+        cards = []
+        for _ in range(limit):
+            expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
+            card_cvv = cvv or generate_cvv(bin_info.get("type"))
+
+            # Generate card with triple validation
+            card_number = generate_card_number(bin)
+
+            # Final verification
+            if not luhn_checksum(card_number):
+                raise HTTPException(500, "Failed to generate valid card number")
+
+            cards.append(CardInfo(
+                number=card_number,
+                expiry=f"{expiry_month}/{expiry_year}",
+                cvv=card_cvv,
+                brand=bin_info.get("scheme"),
+                type=bin_info.get("type")
+            ))
+
+        # Prepare response
+        return GenerateResponse(
+            cards=cards,
+            bin_info=BinInfo(
+                bin=bin[:6],
+                bank=bin_info.get("bank"),
+                country=bin_info.get("country"),
+                country_code=bin_info.get("country_code"),
+                flag=bin_info.get("flag"),
+                scheme=bin_info.get("scheme"),
+                type=bin_info.get("type"),
+                prepaid=bin_info.get("prepaid"),
+                tier=bin_info.get("tier"),
+                currency=bin_info.get("currency")
+            ),
+            generated_at=datetime.utcnow().isoformat()
+        )
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/generate/view")
+async def generate_view(
+    bin: str = Query(..., min_length=6, max_length=16),
+    limit: int = Query(DEFAULT_GEN_LIMIT, ge=1, le=MAX_GEN_LIMIT),
+    month: Optional[str] = Query(None, pattern="^(0[1-9]|1[0-2])$"),
+    year: Optional[str] = Query(None, pattern="^(2[3-9]|[3-9][0-9])$"),
+    cvv: Optional[str] = Query(None, pattern="^[0-9]{3,4}$"),
+):
+    bin_info = await get_bin_info(bin)
+    if not bin_info:
+        raise HTTPException(400, "Couldn't fetch BIN details")
+
+    cards = []
+    for _ in range(limit):
+        expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
+        card_cvv = cvv or generate_cvv(bin_info.get("type"))
+        card_number = generate_card_number(bin)
+
+        if not luhn_checksum(card_number):
+            raise HTTPException(500, "Failed to generate valid card number")
+
+        cards.append(f"{card_number}|{expiry_month}|{expiry_year}|{card_cvv}")
+
+    content = (
+        f"BIN: {bin[:6]}\n"
+        f"SCHEME: {bin_info.get('scheme')}\n"
+        f"TYPE: {bin_info.get('type')}\n"
+        f"TIER: {bin_info.get('tier')}\n"
+        f"PREPAID: {bin_info.get('prepaid')}\n"
+        f"BANK: {bin_info.get('bank')}\n"
+        f"COUNTRY: {bin_info.get('country')} ({bin_info.get('country_code')}) {bin_info.get('flag')}\n"
+        f"CURRENCY: {bin_info.get('currency')}\n"
+        f"==============================\n" +
+        "\n".join(cards)
+    )
+
+    filename = f"cards_{bin[:6]}.txt"
+    headers = {
+        "Content-Disposition": f"attachment; filename={filename}",
+        "Content-Type": "text/plain; charset=utf-8"
+    }
+
+    return Response(content=content, headers=headers)
+
+
+@app.get("/bin/{bin}", response_model=BinInfo)
+async def bin_lookup(bin: str):
+    bin_info = await get_bin_info(bin)
+    if not bin_info:
+        raise HTTPException(404, "BIN not found in any source")
+
+    return BinInfo(
+        bin=bin[:6],
+        bank=bin_info.get("bank"),
+        country=bin_info.get("country"),
+        country_code=bin_info.get("country_code"),
+        flag=bin_info.get("flag"),
+        scheme=bin_info.get("scheme"),
+        type=bin_info.get("type"),
+        prepaid=bin_info.get("prepaid"),
+        tier=bin_info.get("tier"),
+        currency=bin_info.get("currency")
+    )
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
