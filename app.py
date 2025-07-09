@@ -63,8 +63,22 @@ class GenerateResponse(BaseModel):
     generated_at: str
 
 # Helper Functions
+def get_card_type(bin: str) -> str:
+    """Determine card type based on BIN"""
+    clean_bin = re.sub(r'[^\d]', '', bin)
+    if clean_bin.startswith('4'):
+        return "visa"
+    elif clean_bin.startswith(('34', '37')):
+        return "amex"
+    elif clean_bin.startswith(('51', '52', '53', '54', '55', '2221', '2720')):
+        return "mastercard"
+    elif clean_bin.startswith(('6011', '65')):
+        return "discover"
+    else:
+        return "unknown"
+
 def luhn_checksum(card_number: str) -> bool:
-    """Validate card number using Luhn algorithm with double verification"""
+    """Validate card number using Luhn algorithm"""
     if not card_number.isdigit():
         return False
 
@@ -82,18 +96,25 @@ def luhn_checksum(card_number: str) -> bool:
     return total % 10 == 0
 
 def generate_card_number(bin: str) -> str:
-    """Generate valid card number from BIN with triple Luhn verification"""
+    """Generate valid card number from BIN with proper length and Luhn verification"""
     # Clean the BIN (remove non-digits)
     clean_bin = re.sub(r'[^\d]', '', bin)
-
+    
     # Validate BIN length
     if len(clean_bin) < 6 or len(clean_bin) > 15:
         raise ValueError("BIN must be between 6-15 digits")
 
-    # Generate the base number (BIN + random digits, leaving room for check digit)
-    missing_digits = 15 - len(clean_bin)
+    # Determine card length based on type
+    card_type = get_card_type(clean_bin)
+    if card_type == "amex":
+        card_length = 15
+    else:  # visa, mastercard, etc.
+        card_length = 16
+
+    # Calculate how many digits we need to generate
+    missing_digits = card_length - 1 - len(clean_bin)  # -1 for check digit
     if missing_digits < 0:
-        raise ValueError("BIN too long")
+        raise ValueError("BIN too long for card type")
 
     # Generate random middle digits
     middle_digits = ''.join([str(random.randint(0, 9)) for _ in range(missing_digits)])
@@ -112,13 +133,12 @@ def generate_card_number(bin: str) -> str:
     check_digit = (10 - (total % 10)) % 10
     full_number = partial_number + str(check_digit)
 
-    # Triple verification
+    # Verification
     if not luhn_checksum(full_number):
-        # If failed, regenerate (should theoretically never happen)
         return generate_card_number(bin)
 
     # Additional format check
-    if len(full_number) not in (15, 16) or not full_number.isdigit():
+    if len(full_number) != card_length or not full_number.isdigit():
         return generate_card_number(bin)
 
     return full_number
@@ -128,9 +148,13 @@ def generate_expiry() -> tuple:
     expiry_date = datetime.now() + timedelta(days=random.randint(365, 365*5))
     return (expiry_date.strftime("%m"), expiry_date.strftime("%y"))
 
-def generate_cvv(card_type: Optional[str]) -> str:
+def generate_cvv(bin: Optional[str] = None, card_type: Optional[str] = None) -> str:
     """Generate random CVV with correct length for card type"""
-    if card_type and "amex" in card_type.lower():
+    # Determine card type if not provided
+    if not card_type and bin:
+        card_type = get_card_type(bin)
+    
+    if card_type and card_type.lower() == "amex":
         return str(random.randint(1000, 9999))  # Amex has 4-digit CVV
     return str(random.randint(100, 999))  # Others have 3-digit CVV
 
@@ -138,6 +162,25 @@ async def get_bin_info(bin: str) -> Optional[dict]:
     """Fetch BIN information from multiple public APIs"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     bin_to_use = bin[:6]
+    card_type = get_card_type(bin_to_use)
+
+    # Default response structure
+    bin_info = {
+        "type": "credit",
+        "scheme": card_type.upper() if card_type != "unknown" else None,
+        "prepaid": False,
+        "luhn": True
+    }
+
+    # Add specific handling for Amex
+    if card_type == "amex":
+        bin_info.update({
+            "bank": "American Express",
+            "country": "United States",
+            "country_code": "US",
+            "flag": "🇺🇸",
+            "tier": "Corporate" if bin_to_use.startswith('37') else "Personal"
+        })
 
     # 1. Try HandyAPI first
     try:
@@ -150,7 +193,7 @@ async def get_bin_info(bin: str) -> Optional[dict]:
                     data = await res.json()
                     if data.get("Status") == "SUCCESS":
                         country = data.get("Country", {}).get("Name", "").upper()
-                        return {
+                        bin_info.update({
                             "type": data.get("Type"),
                             "scheme": data.get("Scheme"),
                             "tier": data.get("CardTier"),
@@ -161,7 +204,7 @@ async def get_bin_info(bin: str) -> Optional[dict]:
                             "flag": get_flag_emoji(data.get("Country", {}).get("A2")),
                             "prepaid": data.get("Prepaid") == "Yes",
                             "luhn": True
-                        }
+                        })
     except Exception as e:
         print("HandyAPI error:", e)
 
@@ -175,7 +218,7 @@ async def get_bin_info(bin: str) -> Optional[dict]:
                 if res.status == 200:
                     data = await res.json()
                     country = data.get("country", {}).get("name", "").upper()
-                    return {
+                    bin_info.update({
                         "type": data.get("type"),
                         "scheme": data.get("scheme"),
                         "tier": data.get("brand"),
@@ -186,11 +229,11 @@ async def get_bin_info(bin: str) -> Optional[dict]:
                         "flag": data.get("country", {}).get("emoji", "🏳️"),
                         "prepaid": data.get("prepaid", False),
                         "luhn": data.get("number", {}).get("luhn", True)
-                    }
+                    })
     except Exception as e:
         print("binlist.net error:", e)
 
-    return None
+    return bin_info
 
 def get_flag_emoji(country_code: str) -> str:
     """Get flag emoji from country code"""
@@ -231,9 +274,9 @@ async def generate_cards(
         cards = []
         for _ in range(limit):
             expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
-            card_cvv = cvv or generate_cvv(bin_info.get("type"))
+            card_cvv = cvv or generate_cvv(bin=bin)
 
-            # Generate card with triple validation
+            # Generate card with validation
             card_number = generate_card_number(bin)
 
             # Final verification
@@ -283,7 +326,7 @@ async def generate_view(
     cards = []
     for _ in range(limit):
         expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
-        card_cvv = cvv or generate_cvv(bin_info.get("type"))
+        card_cvv = cvv or generate_cvv(bin=bin)
         card_number = generate_card_number(bin)
 
         if not luhn_checksum(card_number):
