@@ -245,7 +245,7 @@ def get_flag_emoji(country_code: str) -> str:
         return "🏳️"
 
 # API Endpoints
-@app.get("/", include_in_schema=False)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root():
     return {
         "message": "Public CC Generator API",
@@ -256,7 +256,7 @@ async def root():
         }
     }
 
-@app.get("/generate", response_model=GenerateResponse)
+@app.api_route("/generate", methods=["GET", "HEAD"], response_model=GenerateResponse)
 async def generate_cards(
     bin: str = Query(..., min_length=6, max_length=16, description="First 6+ digits of card number"),
     limit: int = Query(DEFAULT_GEN_LIMIT, ge=1, le=MAX_GEN_LIMIT, description="Number of cards to generate (max 50)"),
@@ -265,24 +265,17 @@ async def generate_cards(
     cvv: Optional[str] = Query(None, pattern="^[0-9]{3,4}$", description="CVV (3 or 4 digits)")
 ):
     try:
-        # Get BIN info from multiple sources
         bin_info = await get_bin_info(bin)
         if not bin_info:
             raise HTTPException(400, "Couldn't fetch BIN details from any source")
 
-        # Generate cards with unique expiry dates and proper CVV lengths
         cards = []
         for _ in range(limit):
             expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
             card_cvv = cvv or generate_cvv(bin=bin)
-
-            # Generate card with validation
             card_number = generate_card_number(bin)
-
-            # Final verification
             if not luhn_checksum(card_number):
                 raise HTTPException(500, "Failed to generate valid card number")
-
             cards.append(CardInfo(
                 number=card_number,
                 expiry=f"{expiry_month}/{expiry_year}",
@@ -291,7 +284,6 @@ async def generate_cards(
                 type=bin_info.get("type")
             ))
 
-        # Prepare response
         return GenerateResponse(
             cards=cards,
             bin_info=BinInfo(
@@ -311,7 +303,7 @@ async def generate_cards(
     except Exception as e:
         raise HTTPException(400, str(e))
 
-@app.get("/generate/view")
+@app.api_route("/generate/view", methods=["GET", "HEAD"])
 async def generate_view(
     bin: str = Query(..., min_length=6, max_length=16),
     limit: int = Query(DEFAULT_GEN_LIMIT, ge=1, le=MAX_GEN_LIMIT),
@@ -328,10 +320,8 @@ async def generate_view(
         expiry_month, expiry_year = month or generate_expiry()[0], year or generate_expiry()[1]
         card_cvv = cvv or generate_cvv(bin=bin)
         card_number = generate_card_number(bin)
-
         if not luhn_checksum(card_number):
             raise HTTPException(500, "Failed to generate valid card number")
-
         cards.append(f"{card_number}|{expiry_month}|{expiry_year}|{card_cvv}")
 
     content = (
@@ -355,8 +345,7 @@ async def generate_view(
 
     return Response(content=content, headers=headers)
 
-
-@app.get("/bin/{bin}", response_model=BinInfo)
+@app.api_route("/bin/{bin}", methods=["GET", "HEAD"], response_model=BinInfo)
 async def bin_lookup(bin: str):
     bin_info = await get_bin_info(bin)
     if not bin_info:
@@ -375,6 +364,6 @@ async def bin_lookup(bin: str):
         currency=bin_info.get("currency")
     )
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
